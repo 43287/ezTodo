@@ -28,4 +28,3 @@ dist-ssr
 src-tauri/target/
 otherP/.next/
 otherP/out/
-src/
