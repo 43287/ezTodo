@@ -1,6 +1,7 @@
 "use client"
 
-import { createContext, useContext, useState, useEffect, type ReactNode } from "react"
+import { createContext, useContext, useState, useEffect, useRef, type ReactNode } from "react"
+import { todoList as backendTodoList, todoCreate as backendTodoCreate, todoUpdate as backendTodoUpdate, todoDelete as backendTodoDelete, planList as backendPlanList, planCreate as backendPlanCreate, planUpdate as backendPlanUpdate, planDelete as backendPlanDelete, planRefresh as backendPlanRefresh, historyList as backendHistoryList } from "@/lib/tauriClient"
 
 export interface Todo {
   id: string
@@ -207,23 +208,34 @@ function isTodayPlanDay(plan: Plan): boolean {
 }
 
 export function TodoProvider({ children }: { children: ReactNode }) {
-  const [todos, setTodos] = useState<Todo[]>(defaultTodos)
-  const [plans, setPlans] = useState<Plan[]>(defaultPlans)
+  const [todos, setTodos] = useState<Todo[]>([])
+  const [plans, setPlans] = useState<Plan[]>([])
   const [settings, setSettings] = useState<Settings>(defaultSettings)
-  const [history, setHistory] = useState<HistoryRecord[]>(defaultHistory)
+  const [history, setHistory] = useState<HistoryRecord[]>([])
+  const [loaded, setLoaded] = useState<boolean>(false)
+  const planInitDone = useRef<boolean>(false)
 
-  const addHistoryRecord = (record: Omit<HistoryRecord, "id" | "timestamp">) => {
-    const newRecord: HistoryRecord = {
-      ...record,
-      id: `h-${crypto.randomUUID()}`,
-      timestamp: new Date().toISOString(),
-    }
-    setHistory((prev) => [newRecord, ...prev])
+  const refreshHistory = () => {
+    backendHistoryList().then((list) => setHistory(list))
   }
 
   useEffect(() => {
-    const today = new Date().toISOString().split("T")[0]
+    ;(async () => {
+      try {
+        const [todos, plans, history] = await Promise.all([backendTodoList(), backendPlanList(), backendHistoryList()])
+        setTodos(todos)
+        setPlans(plans)
+        setHistory(history)
+        await backendPlanRefresh().then((refreshed) => setPlans(refreshed))
+      } finally {
+        setLoaded(true)
+      }
+    })()
+  }, [])
 
+  useEffect(() => {
+    if (!loaded || planInitDone.current) return
+    const today = new Date().toISOString().split("T")[0]
     setPlans((prevPlans) =>
       prevPlans.map((plan) => {
         if (shouldResetPlan(plan)) {
@@ -232,68 +244,68 @@ export function TodoProvider({ children }: { children: ReactNode }) {
         return plan
       }),
     )
-
     plans.forEach((plan) => {
       if (plan.active && isTodayPlanDay(plan)) {
         const existingTodo = todos.find((t) => t.fromPlanId === plan.id && t.dueDate === today)
         if (!existingTodo) {
-          const newTodo: Todo = {
-            id: `${plan.id}-${today}`,
+          backendTodoCreate({
             title: plan.title,
             description: `${plan.description}\n时间: ${plan.startTime} - ${plan.endTime}`,
-            completed: false,
             important: plan.important,
             dueDate: today,
-            createdAt: today,
             priority: "medium",
             category: plan.category,
             fromPlanId: plan.id,
-          }
-          setTodos((prev) => [newTodo, ...prev])
+          }).then((created) => {
+            setTodos((prev) => [created as Todo, ...prev])
+          })
         }
       }
     })
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+    planInitDone.current = true
+  }, [loaded, plans, todos])
 
   const addTodo = (todo: Omit<Todo, "id" | "createdAt">) => {
-    const newTodo: Todo = {
-      ...todo,
-      id: Date.now().toString(),
-      createdAt: new Date().toISOString().split("T")[0],
-    }
-    setTodos((prev) => [newTodo, ...prev])
-    addHistoryRecord({
-      type: "todo_created",
-      title: todo.title,
-      itemId: newTodo.id,
-      itemType: "todo",
+    backendTodoCreate(todo).then((newTodo) => {
+      setTodos((prev) => [newTodo as Todo, ...prev])
+      refreshHistory()
     })
   }
 
   const updateTodo = (id: string, updates: Partial<Todo>) => {
-    setTodos((prev) => prev.map((todo) => (todo.id === id ? { ...todo, ...updates } : todo)))
+    setTodos((prev) => {
+      const next = prev.map((todo) => (todo.id === id ? { ...todo, ...updates } : todo))
+      const updated = next.find((t) => t.id === id)
+      if (updated) {
+        backendTodoUpdate(updated)
+      }
+      return next
+    })
   }
 
   const deleteTodo = (id: string) => {
-    setTodos((prev) => prev.filter((todo) => todo.id !== id))
+    backendTodoDelete(id).then(() => {
+      setTodos((prev) => prev.filter((todo) => todo.id !== id))
+    })
   }
 
   const toggleComplete = (id: string) => {
-    setTodos((prev) =>
-      prev.map((todo) => {
+    setTodos((prev) => {
+      const next = prev.map((todo) => {
         if (todo.id === id) {
           const newCompleted = !todo.completed
+          const updated: Todo = {
+            ...todo,
+            completed: newCompleted,
+            completedAt: newCompleted ? new Date().toISOString() : undefined,
+          }
+          backendTodoUpdate(updated)
           if (newCompleted) {
-            addHistoryRecord({
-              type: "todo_completed",
-              title: todo.title,
-              itemId: id,
-              itemType: "todo",
-            })
-            if (todo.fromPlanId) {
+            refreshHistory()
+            if (updated.fromPlanId) {
               setPlans((prevPlans) =>
                 prevPlans.map((plan) =>
-                  plan.id === todo.fromPlanId
+                  plan.id === updated.fromPlanId
                     ? {
                         ...plan,
                         currentCount: plan.currentCount + 1,
@@ -302,27 +314,23 @@ export function TodoProvider({ children }: { children: ReactNode }) {
                     : plan,
                 ),
               )
-              addHistoryRecord({
-                type: "plan_completed",
-                title: todo.title,
-                itemId: todo.fromPlanId,
-                itemType: "plan",
-              })
             }
           }
-          return {
-            ...todo,
-            completed: newCompleted,
-            completedAt: newCompleted ? new Date().toISOString() : undefined,
-          }
+          return updated
         }
         return todo
-      }),
-    )
+      })
+      return next
+    })
   }
 
   const toggleImportant = (id: string) => {
-    setTodos((prev) => prev.map((todo) => (todo.id === id ? { ...todo, important: !todo.important } : todo)))
+    setTodos((prev) => {
+      const next = prev.map((todo) => (todo.id === id ? { ...todo, important: !todo.important } : todo))
+      const updated = next.find((t) => t.id === id)
+      if (updated) backendTodoUpdate(updated)
+      return next
+    })
   }
 
   const updateSettings = (updates: Partial<Settings>) => {
@@ -330,94 +338,78 @@ export function TodoProvider({ children }: { children: ReactNode }) {
   }
 
   const addPlan = (plan: Omit<Plan, "id" | "createdAt" | "currentCount" | "totalCompletedCount" | "lastResetDate">) => {
-    const today = new Date().toISOString().split("T")[0]
-    const newPlan: Plan = {
-      ...plan,
-      id: `plan-${Date.now()}`,
-      createdAt: today,
-      currentCount: 0,
-      totalCompletedCount: 0,
-      lastResetDate: today,
-    }
-    setPlans((prev) => [newPlan, ...prev])
-    addHistoryRecord({
-      type: "plan_created",
-      title: plan.title,
-      itemId: newPlan.id,
-      itemType: "plan",
+    backendPlanCreate(plan).then((newPlan) => {
+      setPlans((prev) => [newPlan as Plan, ...prev])
     })
   }
 
   const updatePlan = (id: string, updates: Partial<Plan>) => {
-    setPlans((prev) => prev.map((plan) => (plan.id === id ? { ...plan, ...updates } : plan)))
+    setPlans((prev) => {
+      const next = prev.map((plan) => (plan.id === id ? { ...plan, ...updates } : plan))
+      const updated = next.find((p) => p.id === id)
+      if (updated) backendPlanUpdate(updated)
+      return next
+    })
   }
 
   const deletePlan = (id: string) => {
-    setPlans((prev) => prev.filter((plan) => plan.id !== id))
-    setTodos((prev) => prev.filter((todo) => todo.fromPlanId !== id))
+    backendPlanDelete(id).then(() => {
+      setPlans((prev) => prev.filter((plan) => plan.id !== id))
+      setTodos((prev) => prev.filter((todo) => todo.fromPlanId !== id))
+    })
   }
 
   const togglePlanActive = (id: string) => {
-    setPlans((prev) => prev.map((plan) => (plan.id === id ? { ...plan, active: !plan.active } : plan)))
+    setPlans((prev) => {
+      const next = prev.map((plan) => (plan.id === id ? { ...plan, active: !plan.active } : plan))
+      const updated = next.find((p) => p.id === id)
+      if (updated) backendPlanUpdate(updated)
+      return next
+    })
   }
 
   const togglePlanImportant = (id: string) => {
-    setPlans((prev) => prev.map((plan) => (plan.id === id ? { ...plan, important: !plan.important } : plan)))
+    setPlans((prev) => {
+      const next = prev.map((plan) => (plan.id === id ? { ...plan, important: !plan.important } : plan))
+      const updated = next.find((p) => p.id === id)
+      if (updated) backendPlanUpdate(updated)
+      return next
+    })
   }
 
   const completePlanOnce = (id: string) => {
-    setPlans((prev) =>
-      prev.map((plan) => {
+    setPlans((prev) => {
+      const next = prev.map((plan) => {
         if (plan.id === id) {
           const newTotalCount = plan.totalCompletedCount + 1
           const newCurrentCount = plan.currentCount + 1
-
-          addHistoryRecord({
-            type: "plan_completed",
-            title: plan.title,
-            itemId: id,
-            itemType: "plan",
-          })
-
-          if (plan.repeatCount && newTotalCount >= plan.repeatCount) {
-            return {
-              ...plan,
-              currentCount: newCurrentCount,
-              totalCompletedCount: newTotalCount,
-              active: false,
-            }
-          }
-
-          return {
+          const updated: Plan = {
             ...plan,
             currentCount: newCurrentCount,
             totalCompletedCount: newTotalCount,
+            active: plan.repeatCount && newTotalCount >= (plan.repeatCount ?? 0) ? false : plan.active,
           }
+          backendPlanUpdate(updated)
+          return updated
         }
         return plan
-      }),
-    )
+      })
+      return next
+    })
   }
 
   const endPlan = (id: string) => {
-    setPlans((prev) =>
-      prev.map((plan) => {
+    setPlans((prev) => {
+      const next = prev.map((plan) => {
         if (plan.id === id) {
-          addHistoryRecord({
-            type: "plan_completed",
-            title: `${plan.title} (已结束)`,
-            itemId: id,
-            itemType: "plan",
-          })
-          return {
-            ...plan,
-            active: false,
-            repeatCount: plan.totalCompletedCount,
-          }
+          const updated: Plan = { ...plan, active: false, repeatCount: plan.totalCompletedCount }
+          backendPlanUpdate(updated)
+          return updated
         }
         return plan
-      }),
-    )
+      })
+      return next
+    })
   }
 
   return (
